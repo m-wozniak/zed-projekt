@@ -1,0 +1,465 @@
+---
+title: "Analiza połowu śledzi"
+output:
+  html_document: 
+    theme: readable
+    keep_md: yes
+    toc: true
+  html_notebook: default
+  pdf_document: default
+  
+---
+
+
+
+
+```{r echo=FALSE,  warning=FALSE, error=FALSE, message=FALSE }
+
+set.seed(100)
+
+```
+
+Zaawansowana Eksploracja Danych - projekt zaliczeniowy, semestr ziomowy 2016/17, Politechnika Poznańska.
+`r Sys.time()`
+
+### Streszczenie
+
+Przedmiotem poniższej analizy było zbadanie zjawiska zmniejszania się śledzi na przestrzeni ostatnich kilkudziesięciu lat. Badane parametry obejmowały warunki środowiskowe takie jak temperatura wody czy też dostępność pożywienia, a także zależne te od człowieka - natężenie połowów lub wielkość połowów. 
+
+Zbiór wymagał wstępnego przetwarzania - w jego ramach zostały uzupełnione wartości puste oraz wyeliminowane wartości odstające. Przedstawione zostały także podstawowe charakterystyki poszczególnych zmiennych. Została przeprowadzona także analiza korelacji, w wyniku której można było zauważyć zależności pomiędzy wielkością śledzia, dostępnością planktonu a czynnikami środowiskowymi w postaci zmiany temperatury wody oraz oscylacji północnoatlantyckiej. Przedstawione zostało jak zmieniał się rozmiar śledzi na przestrzeni czasu i w którym momencie nastąpił stoponiowy jego spadek. Zbudowany został także model regresyjny pozwalający na przewidywanie wielkości śledzia na podstawie pozostałych parametrów.  
+
+### Wykorzystane biblioteki
+
+```{r warning=FALSE, error=FALSE, message=FALSE }
+library('caret')
+library('plotly')
+library('pander')
+library('dplyr')
+library('ggplot2')
+library('gridExtra')
+library('corrplot')
+library('GGally')
+
+
+```
+
+### Zbiór danych
+Zbiór zawiera dane komercyjnych połowów śledzi z ostatnich 60 lat. Z każdego połowu wybierano próbkę od 50 do 100 sztuk trzyletnich śledzi i badano ich długość. Zbudowano w ten sposób zbiór ponad 50 tysięcy pomiarów.
+
+#### Opis atrybutów
+
+|Atrybut      |   Opis                                                                       |
+|------------:|:----------------------------------------------------------------------------:|
+|length       |  długość złowionego śledzia [cm]                                             |
+|cfin1        |  dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 1]             |
+|cfin2        |  dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 2]             |
+|chel1        |  dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 1]            |
+|chel2        |  dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 2]            |
+|lcop1        |  dostępność planktonu [zagęszczenie widłonogów gat. 1]                       |
+|lcop2        |  dostępność planktonu [zagęszczenie widłonogów gat. 2]                       |
+|fbar         |  natężenie połowów w regionie [ułamek pozostawionego narybku]                |
+|recr         | roczny narybek [liczba śledzi]                                               |
+|cumf         | łączne roczne natężenie połowów w regionie [ułamek pozostawionego narybku];  |
+|totaln       |  łączna liczba ryb złowionych w ramach połowu [liczba śledzi];               |
+|sst          | temperatura przy powierzchni wody [°C];                                      |
+|sal          | poziom zasolenia wody [Knudsen ppt];                                         |
+|xmonth       | miesiąc połowu [numer miesiąca];                                             |
+|nao          | oscylacja północnoatlantycka [mb].                                           |
+
+
+
+#### Wczytanie zbioru danych i podstawowe charakterystyki
+
+
+```{r eval=FALSE}
+data <- read.csv('sledzie.csv',na.strings = '?')
+summary(data)
+```
+
+```{r echo=FALSE}
+panderOptions ('table.continues','')
+panderOptions ('table.caption.prefix','')
+
+data <- read.csv('sledzie.csv',na.strings = '?')
+pander(summary(data))
+```
+
+
+
+### Wstępne przetwarzanie 
+
+#### Analiza wartości pustych
+W tej części zostanie dokonane uzupełnienie wartości pustych. Jak można zauważyć, wartości puste występują tylko w siedmiu kolumnach a w ich ramach rozkład jest niemal równomierny.
+
+```{r echo=-2}
+sapply(data,function(y) sum (length(which(is.na(y)))))
+```
+
+Zbiór zawiera najprawdopodobniej zdenormalizowane dane z pojedynczych połowów oraz corocznych statystyk. Powoduje to, że większość danych się powtarza w obrębie sąsiednich obserwacji. Poniżej przedstawiony został przykładowy wycinek zbioru. Jak można zauważyć, wartości puste mogą zostać uzupełnione przy wykorzystaniu podobnych obserwacji. 
+
+ 
+```{r}
+data[1:10,3:8]
+```
+
+Ustalenie grup podobnych obserwacji:
+
+```{r}
+removed.na<-data[complete.cases(data),]
+unique.groups <- unique(removed.na[,3:14])
+head(unique.groups)
+nrow(unique.groups)
+```
+
+Poniższa funkcja jako argumenty przyjmuje pojedynczą obserwację oraz zbiór unikalnych obserwacji, a jej rezultatem jest wiersz z uzupełnionymi wartościami pustymi. Poszukiwana jest taka obserwacja ze zbioru, która posiada najmniejszą odległość Hamminga pomiędzy nią a źródłową obserwacją z wartościami pustymi - to ona stanowi podstawę dla uzupełnienia danych. 
+
+```{r}
+
+imputeNA <- function (r,groups,columns) {
+  
+  if (sum(is.na(r))>0) {
+    row<-r[columns]
+    nns<-apply(groups,1,function(x,y) {
+      sum(y[!is.na(y)]!=x[!is.na(y)])
+    },y = row)
+    
+    nn <- unique.groups[names(sort(nns)[1]),]
+    
+    row[is.na(row)]<-unlist(nn[is.na(row)])
+    r[columns]<-row
+  }
+  r
+}
+
+```
+
+Zastosowanie stworzonej funkcji:
+
+```{r cache=TRUE}
+
+data<-as.data.frame(t(apply(data,1,imputeNA,groups=unique.groups,columns=3:14)))
+sapply(data,function(y) sum (length(which(is.na(y)))))
+
+```
+
+Jak widać, z całego zbioru zostały usunięte wartości puste. Osiągnięcie podobnego efektu możliwe byłoby również poprzez zastosowanie np. funkcji `kNN` z pakietu VIM, jednak wiązałoby się to ze znacznym nakładem czasowym (dla każdej obserwacji z wartościami pustymi obliczana by była odległość pomiędzy nią a pozostałymi). Niedogodność ta została ograniczona w proponowanym rozwiązaniu poprzez wykorzystanie grup podobnych obserwacji.
+
+#### Poprawa wartości zmiennej `length`
+
+Można zauważyć, że w zdecydowanej większości przypadków zmienna `lenght` przyjmuje wartości będące wielokrotnością liczby `0.5`. Tak nie dzieje jednak we wszystkich przypadkach: 
+
+```{r}
+data %>% filter (length%%0.5 != 0) %>% summarise(n())
+```
+
+Stanowi to około 0.1% obserwacji. Można więc założyć, że jest to związane z błędem podczas zbierania danych, co w procesie ich czyszczenia warto naprawić.
+
+```{r}
+data<-data %>% mutate( length = round(length*2)/2)
+data %>% filter (length%%0.5 != 0) %>% summarise(n())
+```
+
+
+#### Usuwanie wartości odstających
+Na poniższym zestawieniu histogramów można zauważyć, że zwłaszcza zmienne `cfin1` i `lcop1` mogą zawierać wartości odstające.
+
+```{r echo=FALSE, warning=FALSE, error=FALSE}
+
+
+grid.arrange( 
+  
+  ggplot(data,aes(x=length))+
+    geom_histogram(binwidth = 0.5), 
+  
+  ggplot(data,aes(x=cfin1))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=cfin2))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=chel1))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=chel2))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=lcop1))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=lcop2))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=fbar))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=recr))+
+    geom_histogram(bins=30)+
+        scale_x_continuous(breaks = c(1e+05,1e+06)),
+  
+  ggplot(data,aes(x=cumf))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=totaln))+
+    geom_histogram(bins=30) +
+    scale_x_continuous(breaks = c(1e+05,1e+06)),
+  
+  ggplot(data,aes(x=sst))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=sal))+
+    geom_histogram(bins=30)+
+        scale_x_continuous(breaks = c(35.4,35.6)),
+  
+  ggplot(data,aes(x=nao))+
+    geom_histogram(bins=30)
+  
+  )
+
+
+```
+
+W opracowaniu użyta została odległość Cooka jako miara wpływu, jaki ma obserwacja na model regresji. Jeśli pominięcie danej obserwacji powoduje stosunkowo dużą zmianę współczynników, jest ona potencjalnie odstająca. 
+
+```{r}
+
+data.scaled<-data %>% mutate_each(funs(scale(.) %>% as.vector),  vars=c(-1,-15))
+
+mod <- lm(length ~ ., data=data.scaled[c(-1,-15)])
+cooksd <- cooks.distance(mod)
+
+influential <- as.numeric(names(cooksd)[(cooksd > 4*mean(cooksd))]) 
+
+data<-data[-influential,]
+length(influential)
+```
+
+Poniższy wykres przedstawia zestawienie histogramów po usunięciu `r length(influential)` obserwacji.
+
+```{r echo=FALSE, warning=FALSE, error=FALSE}
+
+
+grid.arrange( 
+  
+  ggplot(data,aes(x=length))+
+    geom_histogram(binwidth = 0.5), 
+  
+  ggplot(data,aes(x=cfin1))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=cfin2))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=chel1))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=chel2))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=lcop1))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=lcop2))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=fbar))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=recr))+
+    geom_histogram(bins=30)+
+        scale_x_continuous(breaks = c(1e+05,1e+06)),
+  
+  ggplot(data,aes(x=cumf))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=totaln))+
+    geom_histogram(bins=30) +
+    scale_x_continuous(breaks = c(1e+05,1e+06)),
+  
+  ggplot(data,aes(x=sst))+
+    geom_histogram(bins=30), 
+  
+  ggplot(data,aes(x=sal))+
+    geom_histogram(bins=30)+
+        scale_x_continuous(breaks = c(35.4,35.6)),
+  
+  ggplot(data,aes(x=nao))+
+    geom_histogram(bins=30)
+  
+  )
+
+
+```
+
+Zgodnie z przypuszeniami zakres został ograniczony najbardziej dla zmiennych `cfin1` i `lcop` oznaczających dostępność planktonu określnego rodzaju, w mniejszym stopniu zmienną `cumf`, czyli roczne natężenie połowów.
+
+### Analiza danych
+
+#### Korelacja zmiennych
+
+Na poniższym wykresie została przedstawiona macierz korelacji:
+
+```{r}
+c <- cor(data %>% select(-X))
+corrplot(c, type="lower", method="color",diag=FALSE)
+
+```
+
+Wykres prezentujący korelację pomiędzy występowaniem różnego rodzaju planktonu. Można zauważyć bardzo duże skorelowanie dostępności planktonu *Calanus finmarchicus* oraz *Calanus finmarchicus* (gatunek 1 i 2), a także ujemną korelację łącznego rocznego natężenia połowów
+
+```{r cache=TRUE, echo=FALSE}
+
+
+
+ggpairs(data %>% select(cfin1, cfin2, chel1, chel2, lcop1, lcop2), columnLabels = c('C. finmar. I', "C. finmar. II","C. helg. I", "C. helg. II", "W-nogi I", "W-nogi II"))
+        
+        
+
+```
+
+
+```{r cache=TRUE, echo=FALSE}
+
+
+
+ggpairs(data %>% select(fbar, totaln, cumf, recr), columnLabels
+        = c("Nat. połowów","L. śledzi / połów","Roczne nat  połowów","Łączny narybek"))
+        
+        
+
+```
+
+W kontekście długości złowionych śledzi największą (ujemną) korelację widzimy dla temperatury przy powierzchni wody.
+
+```{r echo=FALSE, message=FALSE}
+
+ggplot(data, aes(sst, length)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+```
+
+#### Analiza zmiany długości śledzi w czasie
+
+Żeby zaprezentować zmianę rozmiaru złowionych śledzi w czasie w odniesieniu do czynników, które mogły mieć na to wpływ, należy dokonać normalizacji zmiennych. Poniższa funkcja realizuje normalizację min-max:
+
+```{r}
+
+normalize <- function (df,cols) {
+  
+z<-as.data.frame(df[,cols])
+
+  z<- apply(z, 2, function(x) {
+    ranx <- range(x)
+    (x - ranx[1]) / diff(ranx)
+  })
+  
+df[,cols]<-z
+df
+}
+
+data.normalized<-normalize(data,c(2:14,16))
+
+```
+
+Dodatkowo, uśredniona została ilość pożywienia, którą dysponowały śledzie w danym czasie:
+
+```{r}
+
+data.normalized <- data.normalized %>% mutate( avg.food = rowMeans(.[,3:8]))
+
+```
+
+Na poniższym wykresie zaprezentowano jak zmieniały się czynniki wpływające na wielkość śledzi. Widać wyraźnie zależność pomiędzy ilością pożywienia a długością ryb. Dodatkowo można zauważyć jak wpłyneła zmiana temperatury wody oraz występowanie zjawiska oscylacji północnoatlantyckiej, która może być bezpośrednią przyczyną zmiany ilości planktonu, a tym samym efektywności połowów. Widoczny jest też dokładny moment zmiany trendu.
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+ggplot(data=data.normalized, aes(x = X)) +
+  geom_smooth(aes(y=length, colour="Długość")) +
+  geom_smooth(aes(y=avg.food, colour="Pożywienie")) +
+  geom_smooth(aes(y=sst, colour="Temperatura przy powierzchni")) +
+  geom_smooth(aes(y=sal, colour="Zasolenie")) +
+  geom_smooth(aes(y=nao, colour="Oscylacja północnoatlantycka")) +
+  scale_colour_manual("", 
+                      breaks = c("Długość","Pożywienie","Temperatura przy powierzchni","Zasolenie","Oscylacja północnoatlantycka"),
+                     values=c("black","red","blue","green","violet")
+                     ) +
+  scale_y_continuous("") +
+  geom_vline(aes(xintercept=17500),
+             linetype=4, colour="black") + 
+  geom_text(aes(17500,0.8,label = "Zmiana trendu", vjust = -1)) 
+
+```
+
+#### Interaktywny wykres
+
+```{r message=FALSE, echo=FALSE}
+samples<-data.normalized[sample(nrow(data.normalized),3000), ]
+ggplotly(ggplot(data=samples, aes(x = X)) +
+  geom_smooth(aes(y=length, colour="Długość")) +
+  scale_colour_manual("", 
+                      breaks = c("Długość"),
+                     values=c("black")
+                     ) +
+  scale_y_continuous("") +
+  geom_vline(aes(xintercept=17500),
+             linetype=4, colour="black") + 
+  geom_text(aes(17500,0.8,label = "Zmiana trendu", vjust = -1)) )
+
+```
+
+#### Regresja
+
+W celu przewidywania długości śledzia na podstawie pozostałych zmiennych stworzony został model regresji. Wybrany algorytm to Stochastic Gradient Boosting z pakietu `caret`. 
+
+```{r echo=TRUE, warning=FALSE, error=FALSE, message=FALSE, results='hide'}
+
+
+inTraining <- createDataPartition(data$length, p = .75, list = FALSE)
+training <- data[ inTraining,-1]
+testing  <- data[-inTraining,-1]
+
+
+caretGrid <- expand.grid(interaction.depth=c(1, 2, 3), n.trees = (1:20)*5,
+                         shrinkage=c(0.01, 0.001),
+                         n.minobsinnode=10)
+metric <- "RMSE"
+trainControl <- trainControl(method="cv", number=10, verboseIter = TRUE)
+
+gbm.caret <- train(length ~ ., data=training, distribution="gaussian", method="gbm",
+                   trControl=trainControl, verbose=FALSE, 
+                   tuneGrid=caretGrid, metric=metric, bag.fraction=0.75)                    
+
+
+
+```
+
+Wykres przedstawiający błąd średniokwadratowy dla strojonych parametrów modelu. 
+  
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE}
+
+ggplot(gbm.caret)
+
+
+```
+
+Trafność regresji dla danych testowych w postaci miar RMSE i R^2:
+
+```{r }
+
+predict.ts<- predict(gbm.caret,testing)
+predict.sm <- data.frame(obs=testing$length, pred=predict.ts)
+defaultSummary(predict.sm)
+
+```
+
+Wykres ważności atrybutów.
+
+```{r echo=FALSE, warning=FALSE, error=FALSE, message=FALSE }
+
+ggplot(varImp(gbm.caret))
+
+```
+
+Wcześniejsze przypuszczenia się potwierdziły - temperatura wody jest najbardziej istotną zmienną w procesie predykcji wielkości śledzia. Istotny okazał się także roczny narybek oraz pokarm - parametry `recr` oraz `lcop1`, `lcop2`, `cfin2` i `chel2`. 
+
+
+
